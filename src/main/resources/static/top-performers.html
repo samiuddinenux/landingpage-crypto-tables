@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Crypto Overview</title>
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client@1/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stompjs@2.3.3/lib/stomp.min.js"></script>
+    <style>
+        table {
+            width: 45%;
+            margin: 20px;
+            border-collapse: collapse;
+            font-family: Arial, sans-serif;
+        }
+        th, td {
+            padding: 10px;
+            text-align: center;
+            border: 1px solid #ccc;
+        }
+        th {
+            background: #f0f0f0;
+        }
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        h2 {
+            text-align: center;
+        }
+        img.logo {
+            width: 20px;
+            height: 20px;
+            vertical-align: middle;
+            margin-right: 6px;
+        }
+        .container {
+            display: flex;
+            justify-content: space-around;
+            flex-wrap: wrap;
+        }
+    </style>
+</head>
+<body>
+<h2>📊 Live Crypto Dashboard: Popular | Gainers | Losers</h2>
+<div class="container">
+
+    <!-- Popular Table -->
+    <table id="popularTable">
+        <thead>
+        <tr><th colspan="3">🌟 Top 6 Popular</th></tr>
+        <tr>
+            <th>Pair</th>
+            <th>Price (USD)</th>
+            <th>% Change (24h)</th>
+        </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <!-- Gainers Table -->
+    <table id="gainersTable">
+        <thead>
+        <tr><th colspan="4">🔺 Top 6 Gainers</th></tr>
+        <tr>
+            <th>Pair</th>
+            <th>Price</th>
+            <th>% Change</th>
+            <th>Logo</th>
+        </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <!-- Losers Table -->
+    <table id="losersTable">
+        <thead>
+        <tr><th colspan="4">🔻 Top 6 Losers</th></tr>
+        <tr>
+            <th>Pair</th>
+            <th>Price</th>
+            <th>% Change</th>
+            <th>Logo</th>
+        </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+</div>
+
+<script>
+    const popularTableBody = document.querySelector("#popularTable tbody");
+    const popularCoins = {};
+
+    function updatePopularTable(data) {
+        data.forEach(item => {
+            popularCoins[item.pair] = item;
+        });
+
+        const sorted = Object.values(popularCoins).sort((a, b) => b.price - a.price);
+        popularTableBody.innerHTML = "";
+        sorted.forEach(item => {
+            const price = parseFloat(item.price);
+            const change = parseFloat(item.change);
+            const row = `<tr>
+                <td>
+                    <img class="logo" src="${item.logo || ''}" alt="logo" onerror="this.style.display='none'"/>
+                    ${item.pair}
+                </td>
+                <td>$${price < 1 ? price.toFixed(6) : price.toFixed(2)}</td>
+                <td style="color:${change >= 0 ? 'green' : 'red'};">
+                    ${change.toFixed(2)}%
+                </td>
+            </tr>`;
+            popularTableBody.innerHTML += row;
+        });
+    }
+
+    function updateTable(tableId, data) {
+        const tbody = document.querySelector(`#${tableId} tbody`);
+        tbody.innerHTML = "";
+        data.forEach(item => {
+            const row = `<tr>
+                <td>${item.pair}</td>
+                <td>$${parseFloat(item.price).toFixed(item.price < 1 ? 6 : 2)}</td>
+                <td style="color:${item.change >= 0 ? 'green' : 'red'};">${parseFloat(item.change).toFixed(2)}%</td>
+                <td><img class="logo" src="${item.logo || ''}" alt="logo" onerror="this.style.display='none'"/></td>
+            </tr>`;
+            tbody.innerHTML += row;
+        });
+    }
+
+    const socket = new SockJS('/ws');
+    const stompClient = Stomp.over(socket);
+
+    stompClient.connect({}, function (frame) {
+        console.log("Connected: " + frame);
+
+        // ✅ Safe to subscribe inside this callback
+        stompClient.subscribe("/topic/summary", function (msg) {
+            const data = JSON.parse(msg.body);
+            console.log("[Summary]", data);
+
+            updatePopularTable(data.popular);
+            updateTable("gainersTable", data.gainers);
+            updateTable("losersTable", data.losers);
+        });
+    });
+
+
+
+
+
+</script>
+</body>
+</html>
+
+
