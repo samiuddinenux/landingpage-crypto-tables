@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
@@ -14,11 +16,14 @@ import org.springframework.web.reactive.socket.client.ReactorNettyWebSocketClien
 import reactor.core.publisher.Mono;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
 public class OkxTopMoversService {
+
+    private static final Logger logger = LoggerFactory.getLogger(OkxTopMoversService.class);
 
     private final StringRedisTemplate redisTemplate;
     private final SimpMessagingTemplate messagingTemplate;
@@ -40,12 +45,19 @@ public class OkxTopMoversService {
 
     public void subscribeToAllPairs() {
         String cmcData = redisTemplate.opsForValue().get("crypto:latest");
-        if (cmcData == null) return;
+        if (cmcData == null) {
+            logger.warn("No CMC data, retrying in 5s");
+            Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToAllPairs());
+            return;
+        }
 
         try {
             JsonNode root = mapper.readTree(cmcData);
             JsonNode dataArray = root.get("data");
-            if (dataArray == null || !dataArray.isArray()) return;
+            if (dataArray == null || !dataArray.isArray()) {
+                logger.warn("Invalid CMC data");
+                return;
+            }
 
             List<String> allPairs = new ArrayList<>();
             for (JsonNode coin : dataArray) {
@@ -54,7 +66,7 @@ public class OkxTopMoversService {
                 allPairs.add(instId);
             }
 
-            int batchSize = 100;
+            int batchSize = 50; // OKX WebSocket limit
             for (int i = 0; i < allPairs.size(); i += batchSize) {
                 List<Map<String, String>> argsList = new ArrayList<>();
                 for (int j = i; j < Math.min(i + batchSize, allPairs.size()); j++) {
@@ -71,22 +83,31 @@ public class OkxTopMoversService {
                 String payload;
                 try {
                     payload = mapper.writeValueAsString(subscribeMsg);
+                    logger.info("Subscribing to tickers batch: {}", payload);
                 } catch (JsonProcessingException e) {
-                    throw new RuntimeException(e);
+                    logger.error("Failed to serialize subscription: {}", e.getMessage());
+                    continue;
                 }
 
                 client.execute(
                         URI.create(websocketUrl),
                         session -> session.send(Mono.just(session.textMessage(payload)))
+                                .doOnSuccess(v -> logger.info("Subscribed to tickers batch"))
                                 .thenMany(session.receive()
                                         .map(WebSocketMessage::getPayloadAsText)
-                                        .doOnNext(this::handleWebSocketData))
+                                        .doOnNext(msg -> logger.debug("Received ticker: {}", msg))
+                                        .doOnNext(this::handleWebSocketData)
+                                        .doOnError(e -> logger.error("WebSocket receive error: {}", e.getMessage())))
                                 .then()
-                ).subscribe();
+                ).doOnError(e -> {
+                    logger.error("WebSocket connection error: {}", e.getMessage());
+                    Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToAllPairs());
+                }).subscribe();
             }
 
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.error("Subscription error: {}", e.getMessage());
+            Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToAllPairs());
         }
     }
 
@@ -94,16 +115,20 @@ public class OkxTopMoversService {
         try {
             JsonNode root = mapper.readTree(message);
             JsonNode dataArray = root.get("data");
-            if (dataArray == null || !dataArray.isArray() || dataArray.isEmpty()) return;
+            if (dataArray == null || !dataArray.isArray() || dataArray.isEmpty()) {
+                logger.debug("No ticker data in message: {}", message);
+                return;
+            }
 
             JsonNode data = dataArray.get(0);
             String instId = root.get("arg").get("instId").asText();
             double okxPrice = data.get("last").asDouble();
 
             redisTemplate.opsForValue().set("okx:" + instId, String.format("%.6f", okxPrice));
+            logger.debug("Stored price for {}: {}", instId, okxPrice);
 
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.error("Error processing ticker: {}", e.getMessage());
         }
     }
 
@@ -122,6 +147,7 @@ public class OkxTopMoversService {
                 try {
                     change = Double.parseDouble(changeStr);
                 } catch (NumberFormatException e) {
+                    logger.warn("Invalid change24h for {}: {}", instId, changeStr);
                     continue;
                 }
 
@@ -151,14 +177,17 @@ public class OkxTopMoversService {
             gainers = gainers.stream().limit(6).collect(Collectors.toList());
             losers = losers.stream().limit(6).collect(Collectors.toList());
 
+            String gainersJson = mapper.writeValueAsString(gainers);
+            String losersJson = mapper.writeValueAsString(losers);
+            redisTemplate.opsForValue().set("gainers:json", gainersJson);
+            redisTemplate.opsForValue().set("losers:json", losersJson);
+
             messagingTemplate.convertAndSend("/topic/gainers", gainers);
             messagingTemplate.convertAndSend("/topic/losers", losers);
+            logger.debug("Broadcasted gainers: {}, losers: {}", gainers.size(), losers.size());
 
-            redisTemplate.opsForValue().set("gainers:json", mapper.writeValueAsString(gainers));
-            redisTemplate.opsForValue().set("losers:json", mapper.writeValueAsString(losers));
-
-        } catch (JsonProcessingException e) {
-            e.printStackTrace();
+        } catch (Exception e) {
+            logger.error("Error broadcasting top movers: {}", e.getMessage());
         }
     }
 }

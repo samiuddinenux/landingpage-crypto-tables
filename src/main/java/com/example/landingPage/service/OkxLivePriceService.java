@@ -4,6 +4,8 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
@@ -14,10 +16,13 @@ import org.springframework.web.reactive.socket.client.ReactorNettyWebSocketClien
 import reactor.core.publisher.Mono;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.*;
 
 @Service
 public class OkxLivePriceService {
+
+    private static final Logger logger = LoggerFactory.getLogger(OkxLivePriceService.class);
 
     private final StringRedisTemplate redisTemplate;
     private final SimpMessagingTemplate messagingTemplate;
@@ -39,17 +44,31 @@ public class OkxLivePriceService {
 
     public void subscribeToTop6Popular() {
         String cmcData = redisTemplate.opsForValue().get("crypto:latest");
-        if (cmcData == null) return;
+        if (cmcData == null) {
+            logger.warn("No CMC data, retrying in 5s");
+            Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToTop6Popular());
+            return;
+        }
 
         try {
             JsonNode root = mapper.readTree(cmcData);
             JsonNode dataArray = root.get("data");
-            if (dataArray == null || !dataArray.isArray()) return;
+            if (dataArray == null || !dataArray.isArray()) {
+                logger.warn("Invalid CMC data");
+                return;
+            }
 
             List<String> top6Popular = new ArrayList<>();
             for (int i = 0; i < 6 && i < dataArray.size(); i++) {
                 String symbol = dataArray.get(i).get("symbol").asText();
-                top6Popular.add(symbol + "-USDT");
+                String instId = symbol + "-USDT";
+                top6Popular.add(instId);
+            }
+
+            if (top6Popular.isEmpty()) {
+                logger.warn("No top pairs found, retrying in 5s");
+                Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToTop6Popular());
+                return;
             }
 
             List<Map<String, String>> argsList = new ArrayList<>();
@@ -67,21 +86,30 @@ public class OkxLivePriceService {
             String payload;
             try {
                 payload = mapper.writeValueAsString(subscribeMsg);
+                logger.info("Subscribing to tickers: {}", payload);
             } catch (JsonProcessingException e) {
-                throw new RuntimeException(e);
+                logger.error("Failed to serialize subscription: {}", e.getMessage());
+                return;
             }
 
             client.execute(
                     URI.create(websocketUrl),
                     session -> session.send(Mono.just(session.textMessage(payload)))
+                            .doOnSuccess(v -> logger.info("Subscribed to tickers"))
                             .thenMany(session.receive()
                                     .map(WebSocketMessage::getPayloadAsText)
-                                    .doOnNext(this::handleWebSocketData))
+                                    .doOnNext(msg -> logger.debug("Received ticker: {}", msg))
+                                    .doOnNext(this::handleWebSocketData)
+                                    .doOnError(e -> logger.error("WebSocket receive error: {}", e.getMessage())))
                             .then()
-            ).subscribe();
+            ).doOnError(e -> {
+                logger.error("WebSocket connection error: {}", e.getMessage());
+                Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToTop6Popular());
+            }).subscribe();
 
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.error("Subscription error: {}", e.getMessage());
+            Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToTop6Popular());
         }
     }
 
@@ -89,7 +117,10 @@ public class OkxLivePriceService {
         try {
             JsonNode root = mapper.readTree(message);
             JsonNode dataArray = root.get("data");
-            if (dataArray == null || !dataArray.isArray() || dataArray.isEmpty()) return;
+            if (dataArray == null || !dataArray.isArray() || dataArray.isEmpty()) {
+                logger.debug("No ticker data in message: {}", message);
+                return;
+            }
 
             JsonNode data = dataArray.get(0);
             String instId = root.get("arg").get("instId").asText();
@@ -97,21 +128,24 @@ public class OkxLivePriceService {
 
             redisTemplate.opsForValue().set("okx:" + instId, String.format("%.6f", okxPrice));
 
-            // Store update object with logo and circulating supply
             String symbol = instId.replace("-USDT", "");
             String logo = redisTemplate.opsForValue().get("logo:" + symbol);
             String circulatingSupply = redisTemplate.opsForValue().get("supply:" + symbol);
+            String change24h = redisTemplate.opsForValue().get("change24h:" + instId);
 
             Map<String, Object> update = new HashMap<>();
             update.put("pair", instId);
             update.put("price", okxPrice);
             update.put("logo", logo);
             update.put("circulatingSupply", circulatingSupply != null ? Double.parseDouble(circulatingSupply) : null);
+            update.put("change", change24h != null ? Double.parseDouble(change24h) : 0.0);
 
-            redisTemplate.opsForValue().set("popular:" + instId, mapper.writeValueAsString(update));
+            String updateJson = mapper.writeValueAsString(update);
+            redisTemplate.opsForValue().set("popular:" + instId, updateJson);
+            logger.debug("Stored popular:{}: {}", instId, updateJson);
 
         } catch (Exception e) {
-            e.printStackTrace();
+            logger.error("Error processing ticker: {}", e.getMessage());
         }
     }
 

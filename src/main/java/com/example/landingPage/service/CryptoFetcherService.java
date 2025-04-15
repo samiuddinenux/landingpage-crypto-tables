@@ -2,9 +2,10 @@ package com.example.landingPage.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.ValueOperations;
 import org.springframework.http.*;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -15,6 +16,8 @@ import java.util.*;
 
 @Service
 public class CryptoFetcherService {
+
+    private static final Logger logger = LoggerFactory.getLogger(CryptoFetcherService.class);
 
     private final RestTemplate restTemplate = new RestTemplate();
     private final SimpMessagingTemplate messagingTemplate;
@@ -34,23 +37,25 @@ public class CryptoFetcherService {
 
     @Scheduled(fixedRate = 3600000) // Every hour
     public void fetchAndBroadcastCryptoData() {
-        HttpHeaders headers = new HttpHeaders();
-        headers.set("X-CMC_PRO_API_KEY", apiKey);
-        HttpEntity<String> entity = new HttpEntity<>(headers);
+        try {
+            HttpHeaders headers = new HttpHeaders();
+            headers.set("X-CMC_PRO_API_KEY", apiKey);
+            HttpEntity<String> entity = new HttpEntity<>(headers);
 
-        ResponseEntity<String> response = restTemplate.exchange(apiUrl + "?limit=100", HttpMethod.GET, entity, String.class);
+            ResponseEntity<String> response = restTemplate.exchange(apiUrl + "?limit=100", HttpMethod.GET, entity, String.class);
 
-        if (response.getStatusCode().is2xxSuccessful()) {
-            String data = response.getBody();
+            if (response.getStatusCode().is2xxSuccessful()) {
+                String data = response.getBody();
+                redisTemplate.opsForValue().set("crypto:latest", data);
+                logger.info("Stored crypto:latest in Redis");
 
-            // Save to Redis
-            ValueOperations<String, String> ops = redisTemplate.opsForValue();
-            ops.set("crypto:latest", data);
-
-            // Extract coin IDs, symbols, market cap, and circulating supply
-            try {
+                // Extract symbols, market cap, and circulating supply
                 JsonNode root = mapper.readTree(data);
                 JsonNode dataArray = root.get("data");
+                if (dataArray == null || !dataArray.isArray()) {
+                    logger.warn("Invalid CMC data structure");
+                    return;
+                }
 
                 List<String> ids = new ArrayList<>();
                 for (JsonNode coin : dataArray) {
@@ -69,7 +74,6 @@ public class CryptoFetcherService {
 
                 if (infoResponse.getStatusCode().is2xxSuccessful()) {
                     JsonNode infoData = mapper.readTree(infoResponse.getBody()).get("data");
-
                     for (String id : ids) {
                         JsonNode coinInfo = infoData.get(id);
                         if (coinInfo != null && coinInfo.has("symbol") && coinInfo.has("logo")) {
@@ -78,14 +82,17 @@ public class CryptoFetcherService {
                             redisTemplate.opsForValue().set("logo:" + symbol, logo);
                         }
                     }
+                    logger.info("Stored logos for {} coins", ids.size());
+                } else {
+                    logger.warn("Failed to fetch CMC info: {}", infoResponse.getStatusCode());
                 }
 
-            } catch (Exception e) {
-                e.printStackTrace();
+                messagingTemplate.convertAndSend("/topic/crypto", data);
+            } else {
+                logger.error("CMC API request failed: {}", response.getStatusCode());
             }
-
-            // Broadcast original CMC data
-            messagingTemplate.convertAndSend("/topic/crypto", data);
+        } catch (Exception e) {
+            logger.error("Error fetching CMC data: {}", e.getMessage());
         }
     }
 }
