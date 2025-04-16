@@ -1,6 +1,7 @@
 package com.example.landingPage.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
@@ -8,6 +9,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.reactive.socket.WebSocketMessage;
@@ -43,6 +45,11 @@ public class OkxCandlestickService {
         subscribeToCandlesticks();
     }
 
+    @Scheduled(fixedRate = 1000)  // every 1 mai run hoga ticker
+    public void updateTickers() {
+        getValidOkxSpotPairs();
+    }
+
     private void updateCmcMetadata() {
         String cmcData = redisTemplate.opsForValue().get("crypto:latest");
         if (cmcData == null) {
@@ -63,7 +70,7 @@ public class OkxCandlestickService {
             int updated = 0;
             for (JsonNode coin : dataArray) {
                 String symbol = coin.get("symbol").asText();
-                String logo = redisTemplate.opsForValue().get("logo:" + symbol); // Already set by CryptoFetcherService
+                String logo = redisTemplate.opsForValue().get("logo:" + symbol);
                 String supply = redisTemplate.opsForValue().get("supply:" + symbol);
                 if (logo == null && coin.has("logo")) {
                     logo = coin.get("logo").asText();
@@ -74,7 +81,6 @@ public class OkxCandlestickService {
                     supply = String.valueOf(coin.get("circulating_supply").asDouble());
                     redisTemplate.opsForValue().set("supply:" + symbol, supply);
                 }
-
             }
             logger.info("Updated metadata for {} coins from CMC", updated);
         } catch (Exception e) {
@@ -82,6 +88,7 @@ public class OkxCandlestickService {
             Mono.delay(Duration.ofSeconds(10)).subscribe(v -> updateCmcMetadata());
         }
     }
+
     private void fetchHistoricalCandlesticks() {
         List<String> validPairs = getValidOkxSpotPairs();
         for (String instId : validPairs) {
@@ -351,7 +358,6 @@ public class OkxCandlestickService {
         } catch (Exception e) {
             logger.error("Error fetching top pairs by volume: {}", e.getMessage());
             return validPairs.stream().limit(limit).collect(Collectors.toList());
-
         }
     }
 }
