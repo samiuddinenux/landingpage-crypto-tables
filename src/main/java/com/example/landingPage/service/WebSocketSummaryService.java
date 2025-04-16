@@ -6,29 +6,29 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import com.example.landingPage.config.WebSocketConfig.WebSocketHandler;
 
 import java.util.*;
+import java.util.stream.Collectors;
 
 @Service
 public class WebSocketSummaryService {
 
     private static final Logger logger = LoggerFactory.getLogger(WebSocketSummaryService.class);
 
-    private final SimpMessagingTemplate messagingTemplate;
+    private final WebSocketHandler webSocketHandler;
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper mapper = new ObjectMapper();
 
     @Autowired
-    public WebSocketSummaryService(SimpMessagingTemplate messagingTemplate, StringRedisTemplate redisTemplate) {
-        this.messagingTemplate = messagingTemplate;
+    public WebSocketSummaryService(WebSocketHandler webSocketHandler, StringRedisTemplate redisTemplate) {
+        this.webSocketHandler = webSocketHandler;
         this.redisTemplate = redisTemplate;
-        this.redisTemplate.afterPropertiesSet();
     }
 
-    @Scheduled(fixedRate = 1000)
+    @Scheduled(fixedRate = 5000)
     public void broadcastSummary() {
         try {
             Map<String, Object> summary = new HashMap<>();
@@ -46,6 +46,17 @@ public class WebSocketSummaryService {
                     }
                 }
             }
+            popular.sort((a, b) -> {
+                String pairA = (String) a.get("pair");
+                String pairB = (String) b.get("pair");
+                List<String> order = Arrays.asList("BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT", "ADA-USDT");
+                int indexA = order.indexOf(pairA);
+                int indexB = order.indexOf(pairB);
+                indexA = indexA == -1 ? Integer.MAX_VALUE : indexA;
+                indexB = indexB == -1 ? Integer.MAX_VALUE : indexB;
+                return Integer.compare(indexA, indexB);
+            });
+            popular = popular.stream().limit(6).collect(Collectors.toList());
             summary.put("popular", popular);
 
             // Candlesticks
@@ -72,6 +83,8 @@ public class WebSocketSummaryService {
                 } catch (Exception e) {
                     logger.error("Failed to parse gainers data: {}", e.getMessage());
                 }
+            } else {
+                logger.warn("No gainers:json found in Redis");
             }
             summary.put("gainers", gainers);
 
@@ -84,10 +97,13 @@ public class WebSocketSummaryService {
                 } catch (Exception e) {
                     logger.error("Failed to parse losers data: {}", e.getMessage());
                 }
+            } else {
+                logger.warn("No losers:json found in Redis");
             }
             summary.put("losers", losers);
 
-            messagingTemplate.convertAndSend("/topic/summary", summary);
+            String summaryJson = mapper.writeValueAsString(summary);
+            webSocketHandler.broadcast(summaryJson);
             logger.debug("Broadcasted summary: popular={}, candlesticks={}, gainers={}, losers={}",
                     popular.size(), candlesticks.size(), gainers.size(), losers.size());
 

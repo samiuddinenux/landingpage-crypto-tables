@@ -3,20 +3,12 @@ package com.example.landingPage.service;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import org.springframework.web.reactive.socket.WebSocketMessage;
-import org.springframework.web.reactive.socket.client.ReactorNettyWebSocketClient;
-import reactor.core.publisher.Mono;
 
-import java.net.URI;
-import java.time.Duration;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -26,168 +18,279 @@ public class OkxTopMoversService {
     private static final Logger logger = LoggerFactory.getLogger(OkxTopMoversService.class);
 
     private final StringRedisTemplate redisTemplate;
-    private final SimpMessagingTemplate messagingTemplate;
     private final ObjectMapper mapper = new ObjectMapper();
-    private final ReactorNettyWebSocketClient client = new ReactorNettyWebSocketClient();
 
-    @Value("${okx.api.websocket-url}")
-    private String websocketUrl;
-
-    public OkxTopMoversService(StringRedisTemplate redisTemplate, SimpMessagingTemplate messagingTemplate) {
+    public OkxTopMoversService(StringRedisTemplate redisTemplate) {
         this.redisTemplate = redisTemplate;
-        this.messagingTemplate = messagingTemplate;
-    }
-
-    @PostConstruct
-    public void init() {
-        subscribeToAllPairs();
-    }
-
-    public void subscribeToAllPairs() {
-        String cmcData = redisTemplate.opsForValue().get("crypto:latest");
-        if (cmcData == null) {
-            logger.warn("No CMC data, retrying in 5s");
-            Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToAllPairs());
-            return;
-        }
-
-        try {
-            JsonNode root = mapper.readTree(cmcData);
-            JsonNode dataArray = root.get("data");
-            if (dataArray == null || !dataArray.isArray()) {
-                logger.warn("Invalid CMC data");
-                return;
-            }
-
-            List<String> allPairs = new ArrayList<>();
-            for (JsonNode coin : dataArray) {
-                String symbol = coin.get("symbol").asText();
-                String instId = symbol + "-USDT";
-                allPairs.add(instId);
-            }
-
-            int batchSize = 50; // OKX WebSocket limit
-            for (int i = 0; i < allPairs.size(); i += batchSize) {
-                List<Map<String, String>> argsList = new ArrayList<>();
-                for (int j = i; j < Math.min(i + batchSize, allPairs.size()); j++) {
-                    Map<String, String> arg = new HashMap<>();
-                    arg.put("channel", "tickers");
-                    arg.put("instId", allPairs.get(j));
-                    argsList.add(arg);
-                }
-
-                Map<String, Object> subscribeMsg = new HashMap<>();
-                subscribeMsg.put("op", "subscribe");
-                subscribeMsg.put("args", argsList);
-
-                String payload;
-                try {
-                    payload = mapper.writeValueAsString(subscribeMsg);
-                    logger.info("Subscribing to tickers batch: {}", payload);
-                } catch (JsonProcessingException e) {
-                    logger.error("Failed to serialize subscription: {}", e.getMessage());
-                    continue;
-                }
-
-                client.execute(
-                        URI.create(websocketUrl),
-                        session -> session.send(Mono.just(session.textMessage(payload)))
-                                .doOnSuccess(v -> logger.info("Subscribed to tickers batch"))
-                                .thenMany(session.receive()
-                                        .map(WebSocketMessage::getPayloadAsText)
-                                        .doOnNext(msg -> logger.debug("Received ticker: {}", msg))
-                                        .doOnNext(this::handleWebSocketData)
-                                        .doOnError(e -> logger.error("WebSocket receive error: {}", e.getMessage())))
-                                .then()
-                ).doOnError(e -> {
-                    logger.error("WebSocket connection error: {}", e.getMessage());
-                    Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToAllPairs());
-                }).subscribe();
-            }
-
-        } catch (Exception e) {
-            logger.error("Subscription error: {}", e.getMessage());
-            Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToAllPairs());
-        }
-    }
-
-    private void handleWebSocketData(String message) {
-        try {
-            JsonNode root = mapper.readTree(message);
-            JsonNode dataArray = root.get("data");
-            if (dataArray == null || !dataArray.isArray() || dataArray.isEmpty()) {
-                logger.debug("No ticker data in message: {}", message);
-                return;
-            }
-
-            JsonNode data = dataArray.get(0);
-            String instId = root.get("arg").get("instId").asText();
-            double okxPrice = data.get("last").asDouble();
-
-            redisTemplate.opsForValue().set("okx:" + instId, String.format("%.6f", okxPrice));
-            logger.debug("Stored price for {}: {}", instId, okxPrice);
-
-        } catch (Exception e) {
-            logger.error("Error processing ticker: {}", e.getMessage());
-        }
     }
 
     @Scheduled(fixedRate = 5000)
-    public void broadcastTopMovers() {
+    public void updateTopMovers() {
         try {
             List<Map<String, Object>> gainers = new ArrayList<>();
             List<Map<String, Object>> losers = new ArrayList<>();
 
-            for (String key : redisTemplate.keys("change24h:*")) {
-                String instId = key.replace("change24h:", "");
-                String changeStr = redisTemplate.opsForValue().get(key);
-                if (changeStr == null) continue;
+            logger.debug("Scanning candle:latest:* for top movers");
+            Set<String> candleKeys = redisTemplate.keys("candle:latest:*");
+            if (candleKeys == null || candleKeys.isEmpty()) {
+                logger.warn("No candle:latest:* keys found");
+                updateFromTickers(gainers, losers);
+                finalizeTopMovers(gainers, losers);
+                return;
+            }
+            logger.debug("Found {} candle:latest:* keys", candleKeys.size());
 
-                double change;
+            // Fetch volume data
+            Map<String, Double> volumeMap = new HashMap<>();
+            String tickersJson = redisTemplate.opsForValue().get("tickers:latest");
+            if (tickersJson != null) {
                 try {
-                    change = Double.parseDouble(changeStr);
-                } catch (NumberFormatException e) {
-                    logger.warn("Invalid change24h for {}: {}", instId, changeStr);
+                    JsonNode tickers = mapper.readTree(tickersJson);
+                    for (JsonNode ticker : tickers) {
+                        String instId = ticker.get("instId").asText();
+                        double vol24h = ticker.has("vol24h") ? ticker.get("vol24h").asDouble() : 0.0;
+                        // Cap volume to prevent overflow
+                        if (vol24h > 1E12) {
+                            logger.warn("Capping inflated volume for {}: {}", instId, vol24h);
+                            vol24h = 1E12;
+                        }
+                        volumeMap.put(instId, vol24h);
+                    }
+                    logger.debug("Loaded volume data for {} pairs", volumeMap.size());
+                } catch (JsonProcessingException e) {
+                    logger.warn("Failed to parse tickers:latest: {}", e.getMessage());
+                }
+            } else {
+                logger.warn("No tickers:latest found in Redis");
+            }
+
+            for (String key : candleKeys) {
+                String instId = key.replace("candle:latest:", "");
+                String candleJson = redisTemplate.opsForValue().get(key);
+                if (candleJson == null) {
+                    logger.debug("No data for key {}", key);
                     continue;
                 }
 
+                JsonNode candleData;
+                try {
+                    candleData = mapper.readTree(candleJson);
+                } catch (JsonProcessingException e) {
+                    logger.warn("Failed to parse candle data for {}: {}", instId, e.getMessage());
+                    continue;
+                }
+
+                if (!candleData.has("change24h") || !candleData.has("price") || !candleData.has("timestamp")) {
+                    logger.warn("Missing required fields for {}: {}", instId, candleData);
+                    continue;
+                }
+
+                double change;
+                double price;
+                long timestamp;
+                try {
+                    change = candleData.get("change24h").asDouble();
+                    price = candleData.get("price").asDouble();
+                    timestamp = candleData.get("timestamp").asLong();
+                } catch (Exception e) {
+                    logger.warn("Invalid field types for {}: {}", instId, e.getMessage());
+                    continue;
+                }
+
+                logger.debug("Processing {}: change24h={}, price={}", instId, change, price);
+
                 String symbol = instId.replace("-USDT", "");
-                String priceStr = redisTemplate.opsForValue().get("okx:" + instId);
-                double price = priceStr != null ? Double.parseDouble(priceStr) : 0.0;
                 String logo = redisTemplate.opsForValue().get("logo:" + symbol);
                 String circulatingSupply = redisTemplate.opsForValue().get("supply:" + symbol);
 
                 Map<String, Object> entry = new HashMap<>();
                 entry.put("pair", instId);
-                entry.put("change", change);
+                entry.put("change24h", change);
                 entry.put("price", price);
-                entry.put("logo", logo);
-                entry.put("circulatingSupply", circulatingSupply != null ? Double.parseDouble(circulatingSupply) : null);
+                entry.put("timestamp", timestamp);
+                entry.put("volume24h", volumeMap.getOrDefault(instId, 0.0));
+
+                // Only include logo and circulatingSupply if available
+                if (logo != null && !logo.isEmpty()) {
+                    entry.put("logo", logo);
+                }
+                if (circulatingSupply != null && !circulatingSupply.isEmpty()) {
+                    try {
+                        entry.put("circulatingSupply", Double.parseDouble(circulatingSupply));
+                    } catch (NumberFormatException e) {
+                        logger.warn("Invalid circulatingSupply for {}: {}", symbol, circulatingSupply);
+                    }
+                }
 
                 if (change > 0) {
                     gainers.add(entry);
+                    logger.debug("Added {} to gainers: change24h={}", instId, change);
                 } else if (change < 0) {
                     losers.add(entry);
+                    logger.debug("Added {} to losers: change24h={}", instId, change);
+                } else {
+                    logger.debug("Skipped {}: change24h=0", instId);
                 }
             }
 
-            gainers.sort((a, b) -> Double.compare((Double) b.get("change"), (Double) a.get("change")));
-            losers.sort((a, b) -> Double.compare((Double) a.get("change"), (Double) b.get("change")));
+            finalizeTopMovers(gainers, losers);
 
+        } catch (Exception e) {
+            logger.error("Error updating top movers: {}", e.getMessage());
+        }
+    }
+
+    private void updateFromTickers(List<Map<String, Object>> gainers, List<Map<String, Object>> losers) {
+        logger.info("Falling back to ticker data for top movers");
+        String tickersJson = redisTemplate.opsForValue().get("tickers:latest");
+        if (tickersJson == null) {
+            logger.warn("No tickers:latest available for fallback");
+            // Default to major coins
+            addDefaultCoins(gainers, losers);
+            return;
+        }
+
+        try {
+            JsonNode tickers = mapper.readTree(tickersJson);
+            for (JsonNode ticker : tickers) {
+                String instId = ticker.get("instId").asText();
+                if (!instId.endsWith("-USDT")) continue;
+
+                double lastPrice = ticker.has("last") ? ticker.get("last").asDouble() : 0.0;
+                double open24h = ticker.has("open24h") ? ticker.get("open24h").asDouble() : 0.0;
+                double vol24h = ticker.has("vol24h") ? ticker.get("vol24h").asDouble() : 0.0;
+                if (vol24h > 1E12) {
+                    logger.warn("Capping inflated volume for {}: {}", instId, vol24h);
+                    vol24h = 1E12;
+                }
+                long timestamp = ticker.has("ts") ? ticker.get("ts").asLong() : System.currentTimeMillis();
+
+                double change24h = open24h != 0 ? ((lastPrice - open24h) / open24h) * 100 : 0.0;
+
+                String symbol = instId.replace("-USDT", "");
+                String logo = redisTemplate.opsForValue().get("logo:" + symbol);
+                String circulatingSupply = redisTemplate.opsForValue().get("supply:" + symbol);
+
+                Map<String, Object> entry = new HashMap<>();
+                entry.put("pair", instId);
+                entry.put("change24h", change24h);
+                entry.put("price", lastPrice);
+                entry.put("timestamp", timestamp);
+                entry.put("volume24h", vol24h);
+
+                if (logo != null && !logo.isEmpty()) {
+                    entry.put("logo", logo);
+                }
+                if (circulatingSupply != null && !circulatingSupply.isEmpty()) {
+                    try {
+                        entry.put("circulatingSupply", Double.parseDouble(circulatingSupply));
+                    } catch (NumberFormatException e) {
+                        logger.warn("Invalid circulatingSupply for {}: {}", symbol, circulatingSupply);
+                    }
+                }
+
+                if (change24h > 0) {
+                    gainers.add(entry);
+                    logger.debug("Fallback: Added {} to gainers: change24h={}", instId, change24h);
+                } else if (change24h < 0) {
+                    losers.add(entry);
+                    logger.debug("Fallback: Added {} to losers: change24h={}", instId, change24h);
+                }
+            }
+        } catch (Exception e) {
+            logger.error("Error processing ticker fallback: {}", e.getMessage());
+            addDefaultCoins(gainers, losers);
+        }
+    }
+
+    private void addDefaultCoins(List<Map<String, Object>> gainers, List<Map<String, Object>> losers) {
+        logger.info("Using default coins as final fallback");
+        List<String> defaults = Arrays.asList("BTC-USDT", "ETH-USDT", "SOL-USDT");
+        long timestamp = System.currentTimeMillis();
+
+        for (String instId : defaults) {
+            String candleJson = redisTemplate.opsForValue().get("candle:latest:" + instId);
+            if (candleJson == null) continue;
+
+            try {
+                JsonNode candleData = mapper.readTree(candleJson);
+                if (!candleData.has("change24h") || !candleData.has("price")) continue;
+
+                double change = candleData.get("change24h").asDouble();
+                double price = candleData.get("price").asDouble();
+                double volume24h = candleData.has("volume24h") ? candleData.get("volume24h").asDouble() : 0.0;
+
+                String symbol = instId.replace("-USDT", "");
+                String logo = redisTemplate.opsForValue().get("logo:" + symbol);
+                String circulatingSupply = redisTemplate.opsForValue().get("supply:" + symbol);
+
+                Map<String, Object> entry = new HashMap<>();
+                entry.put("pair", instId);
+                entry.put("change24h", change);
+                entry.put("price", price);
+                entry.put("timestamp", timestamp);
+                entry.put("volume24h", volume24h);
+
+                if (logo != null && !logo.isEmpty()) {
+                    entry.put("logo", logo);
+                }
+                if (circulatingSupply != null && !circulatingSupply.isEmpty()) {
+                    try {
+                        entry.put("circulatingSupply", Double.parseDouble(circulatingSupply));
+                    } catch (NumberFormatException e) {
+                        logger.warn("Invalid circulatingSupply for {}: {}", symbol, circulatingSupply);
+                    }
+                }
+
+                if (change > 0) {
+                    gainers.add(entry);
+                    logger.debug("Default: Added {} to gainers: change24h={}", instId, change);
+                } else if (change < 0) {
+                    losers.add(entry);
+                    logger.debug("Default: Added {} to losers: change24h={}", instId, change);
+                }
+            } catch (Exception e) {
+                logger.warn("Failed to process default coin {}: {}", instId, e.getMessage());
+            }
+        }
+    }
+
+    private void finalizeTopMovers(List<Map<String, Object>> gainers, List<Map<String, Object>> losers) {
+        try {
+            // Sort by change24h, then volume
+            gainers.sort((a, b) -> {
+                int changeCompare = Double.compare((Double) b.get("change24h"), (Double) a.get("change24h"));
+                if (changeCompare != 0) return changeCompare;
+                return Double.compare((Double) b.get("volume24h"), (Double) a.get("volume24h"));
+            });
+            losers.sort((a, b) -> {
+                int changeCompare = Double.compare((Double) a.get("change24h"), (Double) b.get("change24h"));
+                if (changeCompare != 0) return changeCompare;
+                return Double.compare((Double) b.get("volume24h"), (Double) a.get("volume24h"));
+            });
+
+            // Limit to 6 entries
             gainers = gainers.stream().limit(6).collect(Collectors.toList());
             losers = losers.stream().limit(6).collect(Collectors.toList());
 
+            // Log if lists are empty
+            if (gainers.isEmpty()) {
+                logger.warn("Gainers list is empty after processing");
+            }
+            if (losers.isEmpty()) {
+                logger.warn("Losers list is empty after processing");
+            }
+
+            // Store in Redis
             String gainersJson = mapper.writeValueAsString(gainers);
             String losersJson = mapper.writeValueAsString(losers);
             redisTemplate.opsForValue().set("gainers:json", gainersJson);
             redisTemplate.opsForValue().set("losers:json", losersJson);
 
-            messagingTemplate.convertAndSend("/topic/gainers", gainers);
-            messagingTemplate.convertAndSend("/topic/losers", losers);
-            logger.debug("Broadcasted gainers: {}, losers: {}", gainers.size(), losers.size());
+            logger.info("Updated top movers: gainers={}, losers={}", gainers.size(), losers.size());
 
-        } catch (Exception e) {
-            logger.error("Error broadcasting top movers: {}", e.getMessage());
+        } catch (JsonProcessingException e) {
+            logger.error("Error serializing top movers: {}", e.getMessage());
         }
     }
 }

@@ -7,10 +7,10 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.*;
-import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
+import com.example.landingPage.config.WebSocketConfig.WebSocketHandler;
 
 import java.util.*;
 
@@ -20,7 +20,7 @@ public class CryptoFetcherService {
     private static final Logger logger = LoggerFactory.getLogger(CryptoFetcherService.class);
 
     private final RestTemplate restTemplate = new RestTemplate();
-    private final SimpMessagingTemplate messagingTemplate;
+    private final WebSocketHandler webSocketHandler;
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper mapper = new ObjectMapper();
 
@@ -30,8 +30,8 @@ public class CryptoFetcherService {
     @Value("${coinmarketcap.api.url}")
     private String apiUrl;
 
-    public CryptoFetcherService(SimpMessagingTemplate messagingTemplate, StringRedisTemplate redisTemplate) {
-        this.messagingTemplate = messagingTemplate;
+    public CryptoFetcherService(WebSocketHandler webSocketHandler, StringRedisTemplate redisTemplate) {
+        this.webSocketHandler = webSocketHandler;
         this.redisTemplate = redisTemplate;
     }
 
@@ -87,7 +87,9 @@ public class CryptoFetcherService {
                     logger.warn("Failed to fetch CMC info: {}", infoResponse.getStatusCode());
                 }
 
-                messagingTemplate.convertAndSend("/topic/crypto", data);
+                // Broadcast the raw JSON data to WebSocket clients
+                webSocketHandler.broadcast(data);
+                logger.info("Broadcasted crypto data to WebSocket clients");
             } else {
                 logger.error("CMC API request failed: {}", response.getStatusCode());
             }
