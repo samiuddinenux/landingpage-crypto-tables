@@ -46,7 +46,8 @@ public class OkxCandlestickService {
     private void updateCmcMetadata() {
         String cmcData = redisTemplate.opsForValue().get("crypto:latest");
         if (cmcData == null) {
-            logger.warn("No CMC data available for metadata");
+            logger.warn("No CMC data, retrying in 10s");
+            Mono.delay(Duration.ofSeconds(10)).subscribe(v -> updateCmcMetadata());
             return;
         }
 
@@ -54,27 +55,33 @@ public class OkxCandlestickService {
             JsonNode root = mapper.readTree(cmcData);
             JsonNode dataArray = root.get("data");
             if (dataArray == null || !dataArray.isArray()) {
-                logger.warn("Invalid CMC data format");
+                logger.warn("Invalid CMC data, retrying in 10s");
+                Mono.delay(Duration.ofSeconds(10)).subscribe(v -> updateCmcMetadata());
                 return;
             }
 
+            int updated = 0;
             for (JsonNode coin : dataArray) {
                 String symbol = coin.get("symbol").asText();
-                String logo = coin.has("logo") ? coin.get("logo").asText() : null;
-                String supply = coin.has("circulating_supply") ? coin.get("circulating_supply").asText() : null;
-                if (logo != null) {
+                String logo = redisTemplate.opsForValue().get("logo:" + symbol); // Already set by CryptoFetcherService
+                String supply = redisTemplate.opsForValue().get("supply:" + symbol);
+                if (logo == null && coin.has("logo")) {
+                    logo = coin.get("logo").asText();
                     redisTemplate.opsForValue().set("logo:" + symbol, logo);
+                    updated++;
                 }
-                if (supply != null) {
+                if (supply == null && coin.has("circulating_supply")) {
+                    supply = String.valueOf(coin.get("circulating_supply").asDouble());
                     redisTemplate.opsForValue().set("supply:" + symbol, supply);
                 }
+
             }
-            logger.info("Updated CMC metadata for {} coins", dataArray.size());
+            logger.info("Updated metadata for {} coins from CMC", updated);
         } catch (Exception e) {
-            logger.error("Error updating CMC metadata: {}", e.getMessage());
+            logger.error("Error updating CMC metadata: {}, retrying in 10s", e.getMessage());
+            Mono.delay(Duration.ofSeconds(10)).subscribe(v -> updateCmcMetadata());
         }
     }
-
     private void fetchHistoricalCandlesticks() {
         List<String> validPairs = getValidOkxSpotPairs();
         for (String instId : validPairs) {
@@ -344,6 +351,7 @@ public class OkxCandlestickService {
         } catch (Exception e) {
             logger.error("Error fetching top pairs by volume: {}", e.getMessage());
             return validPairs.stream().limit(limit).collect(Collectors.toList());
+
         }
     }
 }

@@ -1,4 +1,5 @@
-package com.example.landingPage.service;
+
+        package com.example.landingPage.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -40,30 +41,6 @@ public class OkxTopMoversService {
             }
             logger.debug("Found {} candle:latest:* keys", candleKeys.size());
 
-            // Fetch volume data
-            Map<String, Double> volumeMap = new HashMap<>();
-            String tickersJson = redisTemplate.opsForValue().get("tickers:latest");
-            if (tickersJson != null) {
-                try {
-                    JsonNode tickers = mapper.readTree(tickersJson);
-                    for (JsonNode ticker : tickers) {
-                        String instId = ticker.get("instId").asText();
-                        double vol24h = ticker.has("vol24h") ? ticker.get("vol24h").asDouble() : 0.0;
-                        // Cap volume to prevent overflow
-                        if (vol24h > 1E12) {
-                            logger.warn("Capping inflated volume for {}: {}", instId, vol24h);
-                            vol24h = 1E12;
-                        }
-                        volumeMap.put(instId, vol24h);
-                    }
-                    logger.debug("Loaded volume data for {} pairs", volumeMap.size());
-                } catch (JsonProcessingException e) {
-                    logger.warn("Failed to parse tickers:latest: {}", e.getMessage());
-                }
-            } else {
-                logger.warn("No tickers:latest found in Redis");
-            }
-
             for (String key : candleKeys) {
                 String instId = key.replace("candle:latest:", "");
                 String candleJson = redisTemplate.opsForValue().get(key);
@@ -80,47 +57,46 @@ public class OkxTopMoversService {
                     continue;
                 }
 
-                if (!candleData.has("change24h") || !candleData.has("price") || !candleData.has("timestamp")) {
-                    logger.warn("Missing required fields for {}: {}", instId, candleData);
+                if (!hasRequiredFields(candleData)) {
+                    logger.debug("Skipping {}: missing required fields", instId);
                     continue;
                 }
 
                 double change;
                 double price;
                 long timestamp;
+                double volume24h;
+                String logo;
+                double circulatingSupply;
                 try {
                     change = candleData.get("change24h").asDouble();
                     price = candleData.get("price").asDouble();
                     timestamp = candleData.get("timestamp").asLong();
+                    volume24h = candleData.get("volume24h").asDouble();
+                    logo = candleData.get("logo").asText();
+                    circulatingSupply = candleData.get("circulatingSupply").asDouble();
                 } catch (Exception e) {
                     logger.warn("Invalid field types for {}: {}", instId, e.getMessage());
                     continue;
                 }
 
-                logger.debug("Processing {}: change24h={}, price={}", instId, change, price);
+                // Ensure no zero or negative values where inappropriate
+                if (price <= 0 || volume24h < 0 || logo.isEmpty()) {
+                    logger.debug("Skipping {}: invalid values (price={}, volume24h={}, logo={})",
+                            instId, price, volume24h, logo);
+                    continue;
+                }
 
-                String symbol = instId.replace("-USDT", "");
-                String logo = redisTemplate.opsForValue().get("logo:" + symbol);
-                String circulatingSupply = redisTemplate.opsForValue().get("supply:" + symbol);
+                logger.debug("Processing {}: change24h={}, price={}", instId, change, price);
 
                 Map<String, Object> entry = new HashMap<>();
                 entry.put("pair", instId);
                 entry.put("change24h", change);
                 entry.put("price", price);
                 entry.put("timestamp", timestamp);
-                entry.put("volume24h", volumeMap.getOrDefault(instId, 0.0));
-
-                // Only include logo and circulatingSupply if available
-                if (logo != null && !logo.isEmpty()) {
-                    entry.put("logo", logo);
-                }
-                if (circulatingSupply != null && !circulatingSupply.isEmpty()) {
-                    try {
-                        entry.put("circulatingSupply", Double.parseDouble(circulatingSupply));
-                    } catch (NumberFormatException e) {
-                        logger.warn("Invalid circulatingSupply for {}: {}", symbol, circulatingSupply);
-                    }
-                }
+                entry.put("volume24h", volume24h);
+                entry.put("logo", logo);
+                entry.put("circulatingSupply", circulatingSupply);
 
                 if (change > 0) {
                     gainers.add(entry);
@@ -140,12 +116,20 @@ public class OkxTopMoversService {
         }
     }
 
+    private boolean hasRequiredFields(JsonNode candleData) {
+        return candleData.has("change24h") && !candleData.get("change24h").isNull() &&
+                candleData.has("price") && !candleData.get("price").isNull() &&
+                candleData.has("timestamp") && !candleData.get("timestamp").isNull() &&
+                candleData.has("volume24h") && !candleData.get("volume24h").isNull() &&
+                candleData.has("logo") && !candleData.get("logo").isNull() &&
+                candleData.has("circulatingSupply") && !candleData.get("circulatingSupply").isNull();
+    }
+
     private void updateFromTickers(List<Map<String, Object>> gainers, List<Map<String, Object>> losers) {
         logger.info("Falling back to ticker data for top movers");
         String tickersJson = redisTemplate.opsForValue().get("tickers:latest");
         if (tickersJson == null) {
             logger.warn("No tickers:latest available for fallback");
-            // Default to major coins
             addDefaultCoins(gainers, losers);
             return;
         }
@@ -171,23 +155,29 @@ public class OkxTopMoversService {
                 String logo = redisTemplate.opsForValue().get("logo:" + symbol);
                 String circulatingSupply = redisTemplate.opsForValue().get("supply:" + symbol);
 
+                // Skip if any required field is missing
+                if (lastPrice <= 0 || vol24h < 0 || logo == null || logo.isEmpty() ||
+                        circulatingSupply == null || circulatingSupply.isEmpty()) {
+                    logger.debug("Skipping {}: missing or invalid ticker fields", instId);
+                    continue;
+                }
+
+                double circSupply;
+                try {
+                    circSupply = Double.parseDouble(circulatingSupply);
+                } catch (NumberFormatException e) {
+                    logger.warn("Invalid circulatingSupply for {}: {}", symbol, circulatingSupply);
+                    continue;
+                }
+
                 Map<String, Object> entry = new HashMap<>();
                 entry.put("pair", instId);
                 entry.put("change24h", change24h);
                 entry.put("price", lastPrice);
                 entry.put("timestamp", timestamp);
                 entry.put("volume24h", vol24h);
-
-                if (logo != null && !logo.isEmpty()) {
-                    entry.put("logo", logo);
-                }
-                if (circulatingSupply != null && !circulatingSupply.isEmpty()) {
-                    try {
-                        entry.put("circulatingSupply", Double.parseDouble(circulatingSupply));
-                    } catch (NumberFormatException e) {
-                        logger.warn("Invalid circulatingSupply for {}: {}", symbol, circulatingSupply);
-                    }
-                }
+                entry.put("logo", logo);
+                entry.put("circulatingSupply", circSupply);
 
                 if (change24h > 0) {
                     gainers.add(entry);
@@ -214,15 +204,18 @@ public class OkxTopMoversService {
 
             try {
                 JsonNode candleData = mapper.readTree(candleJson);
-                if (!candleData.has("change24h") || !candleData.has("price")) continue;
+                if (!hasRequiredFields(candleData)) {
+                    logger.debug("Skipping default {}: missing required fields", instId);
+                    continue;
+                }
 
                 double change = candleData.get("change24h").asDouble();
                 double price = candleData.get("price").asDouble();
-                double volume24h = candleData.has("volume24h") ? candleData.get("volume24h").asDouble() : 0.0;
+                double volume24h = candleData.get("volume24h").asDouble();
+                String logo = candleData.get("logo").asText();
+                double circulatingSupply = candleData.get("circulatingSupply").asDouble();
 
-                String symbol = instId.replace("-USDT", "");
-                String logo = redisTemplate.opsForValue().get("logo:" + symbol);
-                String circulatingSupply = redisTemplate.opsForValue().get("supply:" + symbol);
+                if (price <= 0 || volume24h < 0 || logo.isEmpty()) continue;
 
                 Map<String, Object> entry = new HashMap<>();
                 entry.put("pair", instId);
@@ -230,17 +223,8 @@ public class OkxTopMoversService {
                 entry.put("price", price);
                 entry.put("timestamp", timestamp);
                 entry.put("volume24h", volume24h);
-
-                if (logo != null && !logo.isEmpty()) {
-                    entry.put("logo", logo);
-                }
-                if (circulatingSupply != null && !circulatingSupply.isEmpty()) {
-                    try {
-                        entry.put("circulatingSupply", Double.parseDouble(circulatingSupply));
-                    } catch (NumberFormatException e) {
-                        logger.warn("Invalid circulatingSupply for {}: {}", symbol, circulatingSupply);
-                    }
-                }
+                entry.put("logo", logo);
+                entry.put("circulatingSupply", circulatingSupply);
 
                 if (change > 0) {
                     gainers.add(entry);
@@ -257,7 +241,6 @@ public class OkxTopMoversService {
 
     private void finalizeTopMovers(List<Map<String, Object>> gainers, List<Map<String, Object>> losers) {
         try {
-            // Sort by change24h, then volume
             gainers.sort((a, b) -> {
                 int changeCompare = Double.compare((Double) b.get("change24h"), (Double) a.get("change24h"));
                 if (changeCompare != 0) return changeCompare;
@@ -269,11 +252,9 @@ public class OkxTopMoversService {
                 return Double.compare((Double) b.get("volume24h"), (Double) a.get("volume24h"));
             });
 
-            // Limit to 6 entries
             gainers = gainers.stream().limit(6).collect(Collectors.toList());
             losers = losers.stream().limit(6).collect(Collectors.toList());
 
-            // Log if lists are empty
             if (gainers.isEmpty()) {
                 logger.warn("Gainers list is empty after processing");
             }
@@ -281,7 +262,6 @@ public class OkxTopMoversService {
                 logger.warn("Losers list is empty after processing");
             }
 
-            // Store in Redis
             String gainersJson = mapper.writeValueAsString(gainers);
             String losersJson = mapper.writeValueAsString(losers);
             redisTemplate.opsForValue().set("gainers:json", gainersJson);
