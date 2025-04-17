@@ -5,232 +5,237 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import com.example.landingPage.config.WebSocketConfig.WebSocketHandler;
+import org.springframework.web.socket.CloseStatus;
+import org.springframework.web.socket.TextMessage;
+import org.springframework.web.socket.WebSocketSession;
+import org.springframework.web.socket.handler.TextWebSocketHandler;
 
+import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Service
-public class WebSocketSummaryService {
+public class WebSocketSummaryService extends TextWebSocketHandler {
 
     private static final Logger logger = LoggerFactory.getLogger(WebSocketSummaryService.class);
 
-    private final WebSocketHandler webSocketHandler;
     private final StringRedisTemplate redisTemplate;
     private final ObjectMapper mapper = new ObjectMapper();
+    private final Set<WebSocketSession> sessions = ConcurrentHashMap.newKeySet();
 
-    @Autowired
-    public WebSocketSummaryService(WebSocketHandler webSocketHandler, StringRedisTemplate redisTemplate) {
-        this.webSocketHandler = webSocketHandler;
+    public WebSocketSummaryService(StringRedisTemplate redisTemplate) {
         this.redisTemplate = redisTemplate;
     }
 
-    @Scheduled(fixedRate = 60000) // Update every minute
-    public void updateGainersAndLosers() {
-        try {
-            List<Map<String, Object>> allPairs = new ArrayList<>();
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+        sessions.add(session);
+        logger.info("New WebSocket connection established: {}", session.getId());
+        // Send all data immediately upon connection
+        sendSummaryToSession(session);
+    }
 
-            // Collect data from candle:latest:*
-            for (String key : redisTemplate.keys("candle:latest:*")) {
-                String json = redisTemplate.opsForValue().get(key);
-                if (json != null) {
-                    try {
-                        Map<String, Object> data = mapper.readValue(json, new TypeReference<Map<String, Object>>() {});
-                        if (data.containsKey("pair") && data.containsKey("change24h") && data.containsKey("price")) {
-                            allPairs.add(data);
-                        }
-                    } catch (Exception e) {
-                        logger.error("Failed to parse candlestick data for key {}: {}", key, e.getMessage());
-                    }
-                }
-            }
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
+        sessions.remove(session);
+        logger.info("WebSocket connection closed: {}, status: {}", session.getId(), status);
+    }
 
-            // Fallback: Use ticker data
-            if (allPairs.size() < 12) {
-                for (String key : redisTemplate.keys("ticker:*")) {
-                    String json = redisTemplate.opsForValue().get(key);
-                    if (json != null) {
-                        try {
-                            JsonNode ticker = mapper.readTree(json);
-                            String instId = ticker.get("instId").asText();
-                            double lastPrice = ticker.get("last").asDouble();
-                            double open24h = ticker.get("open24h").asDouble();
-                            double change24h = open24h != 0 ? ((lastPrice - open24h) / open24h) * 100 : 0.0;
-                            String symbol = instId.replace("-USDT", "");
-                            String logo = redisTemplate.opsForValue().get("logo:" + symbol);
-                            String circulatingSupply = redisTemplate.opsForValue().get("supply:" + symbol);
-                            double volume24h = ticker.get("vol24h").asDouble();
-
-                            Map<String, Object> data = new HashMap<>();
-                            data.put("pair", instId);
-                            data.put("price", lastPrice);
-                            data.put("change24h", String.format("%.2f", change24h));
-                            data.put("logo", logo);
-                            data.put("circulatingSupply", circulatingSupply != null ? Double.parseDouble(circulatingSupply) : null);
-                            String candleJson = redisTemplate.opsForValue().get("candle:latest:" + instId);
-                            long timestamp = System.currentTimeMillis();
-                            if (candleJson != null) {
-                                JsonNode candleData = mapper.readTree(candleJson);
-                                if (candleData.has("timestamp")) {
-                                    timestamp = candleData.get("timestamp").asLong();
-                                }
-                            }
-                            data.put("timestamp", timestamp);
-                            data.put("volume24h", volume24h);
-                            allPairs.add(data);
-                        } catch (Exception e) {
-                            logger.error("Failed to parse ticker data for key {}: {}", key, e.getMessage());
-                        }
-                    }
-                }
-            }
-
-            // Sort by change24h
-            allPairs.sort((a, b) -> Double.compare(
-                    Double.parseDouble((String) b.get("change24h")),
-                    Double.parseDouble((String) a.get("change24h"))
-            ));
-
-            // Select top 6 gainers
-            List<Map<String, Object>> gainers = allPairs.stream()
-                    .filter(p -> Double.parseDouble((String) p.get("change24h")) > 0)
-                    .limit(6)
-                    .collect(Collectors.toList());
-
-            // Select top 6 losers
-            List<Map<String, Object>> losers = allPairs.stream()
-                    .filter(p -> Double.parseDouble((String) p.get("change24h")) < 0)
-                    .sorted((a, b) -> Double.compare(
-                            Double.parseDouble((String) a.get("change24h")),
-                            Double.parseDouble((String) b.get("change24h"))
-                    ))
-                    .limit(6)
-                    .collect(Collectors.toList());
-
-            // Store in Redis
-            redisTemplate.opsForValue().set("gainers:json", mapper.writeValueAsString(gainers));
-            redisTemplate.opsForValue().set("losers:json", mapper.writeValueAsString(losers));
-            logger.info("Updated gainers:json ({} pairs), losers:json ({} pairs)", gainers.size(), losers.size());
-
-        } catch (Exception e) {
-            logger.error("Error updating gainers and losers: {}", e.getMessage());
-        }
+    @Override
+    public void handleTransportError(WebSocketSession session, Throwable exception) throws Exception {
+        logger.error("WebSocket transport error: {}, session: {}", exception.getMessage(), session.getId());
+        sessions.remove(session);
+        session.close(CloseStatus.SERVER_ERROR);
     }
 
     @Scheduled(fixedRate = 5000)
     public void broadcastSummary() {
+        if (sessions.isEmpty()) {
+            logger.debug("No active WebSocket sessions to broadcast to");
+            return;
+        }
+
         try {
-            Map<String, Object> summary = new HashMap<>();
-
-            // Popular coins
-            List<Map<String, Object>> popular = new ArrayList<>();
-            List<String> priorityPairs = Arrays.asList("BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT", "ADA-USDT");
-            Set<String> popularKeys = redisTemplate.keys("popular:*");
-            if (popularKeys == null || popularKeys.isEmpty()) {
-                logger.warn("No popular:* keys, falling back to candle:latest:*");
-                for (String pair : priorityPairs) {
-                    String json = redisTemplate.opsForValue().get("candle:latest:" + pair);
-                    if (json != null) {
-                        try {
-                            Map<String, Object> data = mapper.readValue(json, new TypeReference<Map<String, Object>>() {});
-                            if (data.containsKey("pair") && data.containsKey("price") &&
-                                    data.containsKey("change24h") && data.containsKey("timestamp") &&
-                                    data.containsKey("volume24h")) {
-                                popular.add(data);
-                            }
-                        } catch (Exception e) {
-                            logger.error("Failed to parse candle data for {}: {}", pair, e.getMessage());
-                        }
-                    }
-                }
-            } else {
-                for (String key : popularKeys) {
-                    String json = redisTemplate.opsForValue().get(key);
-                    if (json != null) {
-                        try {
-                            Map<String, Object> data = mapper.readValue(json, new TypeReference<Map<String, Object>>() {});
-                            if (data.containsKey("pair") && data.containsKey("price") &&
-                                    data.containsKey("change24h") && data.containsKey("timestamp") &&
-                                    data.containsKey("volume24h")) {
-                                popular.add(data);
-                            } else {
-                                logger.warn("Incomplete popular data for key {}: {}", key, json);
-                            }
-                        } catch (Exception e) {
-                            logger.error("Failed to parse popular data for key {}: {}", key, e.getMessage());
-                        }
-                    }
-                }
-            }
-
-            // Sort and limit popular
-            popular.sort((a, b) -> {
-                String pairA = (String) a.get("pair");
-                String pairB = (String) b.get("pair");
-                int indexA = priorityPairs.indexOf(pairA);
-                int indexB = priorityPairs.indexOf(pairB);
-                indexA = indexA == -1 ? Integer.MAX_VALUE : indexA;
-                indexB = indexB == -1 ? Integer.MAX_VALUE : indexB;
-                return Integer.compare(indexA, indexB);
-            });
-            popular = popular.stream().limit(6).collect(Collectors.toList());
-            if (popular.isEmpty()) {
-                logger.warn("Popular section is empty");
-            } else if (popular.size() < 6) {
-                logger.warn("Popular section has {} pairs, expected 6", popular.size());
-            }
-            summary.put("popular", popular);
-
-            // Candlesticks
-            List<Map<String, Object>> candlesticks = new ArrayList<>();
-            for (String key : redisTemplate.keys("candle:latest:*")) {
-                String json = redisTemplate.opsForValue().get(key);
-                if (json != null) {
+            String summaryJson = buildSummaryJson();
+            TextMessage message = new TextMessage(summaryJson);
+            for (WebSocketSession session : sessions) {
+                if (session.isOpen()) {
                     try {
-                        Map<String, Object> data = mapper.readValue(json, new TypeReference<Map<String, Object>>() {});
-                        candlesticks.add(data);
-                    } catch (Exception e) {
-                        logger.error("Failed to parse candlestick data for key {}: {}", key, e.getMessage());
+                        session.sendMessage(message);
+                        logger.debug("Sent summary to session: {}", session.getId());
+                    } catch (IOException e) {
+                        logger.error("Error sending message to session {}: {}", session.getId(), e.getMessage());
+                        sessions.remove(session);
+                        try {
+                            session.close(CloseStatus.SERVER_ERROR);
+                        } catch (IOException ex) {
+                            logger.error("Error closing session {}: {}", session.getId(), ex.getMessage());
+                        }
                     }
                 }
             }
-            summary.put("candlesticks", candlesticks);
-
-            // Gainers
-            List<Map<String, Object>> gainers = Collections.emptyList();
-            String gainersJson = redisTemplate.opsForValue().get("gainers:json");
-            if (gainersJson != null) {
-                try {
-                    gainers = mapper.readValue(gainersJson, new TypeReference<List<Map<String, Object>>>() {});
-                } catch (Exception e) {
-                    logger.error("Failed to parse gainers data: {}", e.getMessage());
-                }
-            }
-            summary.put("gainers", gainers);
-
-            // Losers
-            List<Map<String, Object>> losers = Collections.emptyList();
-            String losersJson = redisTemplate.opsForValue().get("losers:json");
-            if (losersJson != null) {
-                try {
-                    losers = mapper.readValue(losersJson, new TypeReference<List<Map<String, Object>>>() {});
-                } catch (Exception e) {
-                    logger.error("Failed to parse losers data: {}", e.getMessage());
-                }
-            }
-            summary.put("losers", losers);
-
-            String summaryJson = mapper.writeValueAsString(summary);
-            webSocketHandler.broadcast(summaryJson);
-            logger.debug("Broadcasted summary: popular={}, candlesticks={}, gainers={}, losers={}",
-                    popular.size(), candlesticks.size(), gainers.size(), losers.size());
-
+            logger.debug("Broadcasted summary to {} sessions", sessions.size());
         } catch (Exception e) {
             logger.error("Error broadcasting summary: {}", e.getMessage());
         }
+    }
+
+    private void sendSummaryToSession(WebSocketSession session) {
+        try {
+            String summaryJson = buildSummaryJson();
+            session.sendMessage(new TextMessage(summaryJson));
+            logger.info("Sent initial summary to session: {}", session.getId());
+        } catch (IOException e) {
+            logger.error("Error sending initial summary to session {}: {}", session.getId(), e.getMessage());
+            sessions.remove(session);
+            try {
+                session.close(CloseStatus.SERVER_ERROR);
+            } catch (IOException ex) {
+                logger.error("Error closing session {}: {}", ex.getMessage());
+            }
+        }
+    }
+
+    private String buildSummaryJson() throws IOException {
+        Map<String, Object> summary = new HashMap<>();
+
+        // Popular coins
+        List<Map<String, Object>> popular = new ArrayList<>();
+        List<String> priorityPairs = Arrays.asList("BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT", "ADA-USDT");
+        for (String pair : priorityPairs) {
+            String json = redisTemplate.opsForValue().get("popular:" + pair);
+            if (json != null) {
+                Map<String, Object> data = mapper.readValue(json, new TypeReference<Map<String, Object>>() {});
+                if (data.containsKey("pair") && data.containsKey("price") &&
+                        data.containsKey("change24h") && data.containsKey("timestamp") &&
+                        data.containsKey("volume24h") && data.containsKey("logo")) {
+                    popular.add(data);
+                } else {
+                    logger.warn("Incomplete popular data for {}: {}", pair, json);
+                    Map<String, Object> fallback = getFallbackPopularData(pair);
+                    if (fallback != null) {
+                        popular.add(fallback);
+                    }
+                }
+            } else {
+                logger.warn("No popular data for {}, using fallback", pair);
+                Map<String, Object> fallback = getFallbackPopularData(pair);
+                if (fallback != null) {
+                    popular.add(fallback);
+                }
+            }
+        }
+
+        if (popular.isEmpty()) {
+            logger.warn("Popular section is empty, using defaults");
+            popular = getDefaultPopularCoins();
+        }
+
+        // Sort popular coins by priority
+        popular.sort((a, b) -> {
+            String pairA = (String) a.get("pair");
+            String pairB = (String) b.get("pair");
+            int indexA = priorityPairs.indexOf(pairA);
+            int indexB = priorityPairs.indexOf(pairB);
+            indexA = indexA == -1 ? Integer.MAX_VALUE : indexA;
+            indexB = indexB == -1 ? Integer.MAX_VALUE : indexB;
+            return Integer.compare(indexA, indexB);
+        });
+        popular = popular.stream().limit(6).collect(Collectors.toList());
+        summary.put("popular", popular);
+
+        // Candlesticks
+        List<Map<String, Object>> candlesticks = new ArrayList<>();
+        Set<String> activePairs = redisTemplate.opsForSet().members("active:pairs");
+        if (activePairs != null) {
+            for (String pair : activePairs) {
+                String json = redisTemplate.opsForValue().get("candle:latest:" + pair);
+                if (json != null) {
+                    Map<String, Object> data = mapper.readValue(json, new TypeReference<Map<String, Object>>() {});
+                    candlesticks.add(data);
+                }
+            }
+        }
+        summary.put("candlesticks", candlesticks);
+
+        // Gainers
+        List<Map<String, Object>> gainers = Collections.emptyList();
+        String gainersJson = redisTemplate.opsForValue().get("gainers:json");
+        if (gainersJson != null) {
+            gainers = mapper.readValue(gainersJson, new TypeReference<List<Map<String, Object>>>(){});
+        }
+        summary.put("gainers", gainers);
+
+        // Losers
+        List<Map<String, Object>> losers = Collections.emptyList();
+        String losersJson = redisTemplate.opsForValue().get("losers:json");
+        if (losersJson != null) {
+            losers = mapper.readValue(losersJson, new TypeReference<List<Map<String, Object>>>(){});
+        }
+        summary.put("losers", losers);
+
+        return mapper.writeValueAsString(summary);
+    }
+
+    private Map<String, Object> getFallbackPopularData(String pair) {
+        try {
+            String tickerJson = redisTemplate.opsForValue().get("TICKER:" + pair);
+            if (tickerJson == null) return null;
+
+            JsonNode ticker = mapper.readTree(tickerJson);
+            String symbol = pair.replace("-USDT", "");
+            double price = ticker.get("last").asDouble();
+            double open24h = ticker.get("open24h").asDouble();
+            double change24h = open24h != 0 ? ((price - open24h) / open24h) * 100 : 0.0;
+            double volume24h = ticker.get("vol24h").asDouble();
+            long timestamp = ticker.has("ts") ? ticker.get("ts").asLong() : System.currentTimeMillis();
+
+            Object logoObj = redisTemplate.opsForHash().get("COININFO:" + symbol, "logo");
+            Object circulatingSupplyObj = redisTemplate.opsForHash().get("COININFO:" + symbol, "circulating_supply");
+            if (logoObj == null || circulatingSupplyObj == null) {
+                logger.debug("Skipping {}: missing logo or circulating_supply", pair);
+                return null;
+            }
+
+            String logo = logoObj.toString();
+            String circulatingSupply = circulatingSupplyObj.toString();
+            Double circulatingSupplyValue;
+            try {
+                circulatingSupplyValue = Double.parseDouble(circulatingSupply);
+            } catch (NumberFormatException e) {
+                logger.warn("Invalid circulating_supply for {}: {}", symbol, circulatingSupply);
+                return null;
+            }
+
+            Map<String, Object> data = new HashMap<>();
+            data.put("pair", pair);
+            data.put("price", price);
+            data.put("change24h", String.format("%.2f", change24h)); // Store as String
+            data.put("logo", logo);
+            data.put("circulatingSupply", circulatingSupplyValue);
+            data.put("timestamp", timestamp);
+            data.put("volume24h", volume24h);
+            return data;
+        } catch (Exception e) {
+            logger.error("Failed to create fallback data for {}: {}", pair, e.getMessage());
+            return null;
+        }
+    }
+
+    private List<Map<String, Object>> getDefaultPopularCoins() {
+        List<Map<String, Object>> defaults = new ArrayList<>();
+        String[] pairs = {"BTC-USDT", "ETH-USDT", "SOL-USDT"};
+        for (String pair : pairs) {
+            Map<String, Object> data = getFallbackPopularData(pair);
+            if (data != null) {
+                defaults.add(data);
+            }
+        }
+        return defaults;
     }
 }

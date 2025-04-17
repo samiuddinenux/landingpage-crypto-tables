@@ -1,7 +1,6 @@
 package com.example.landingPage.service;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
-import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
@@ -9,7 +8,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.reactive.socket.WebSocketMessage;
@@ -19,6 +17,8 @@ import reactor.core.publisher.Mono;
 import java.net.URI;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Service
@@ -40,61 +40,24 @@ public class OkxCandlestickService {
 
     @PostConstruct
     public void init() {
-        updateCmcMetadata();
+        logger.info("Initializing OkxCandlestickService");
         fetchHistoricalCandlesticks();
         subscribeToCandlesticks();
     }
 
-    @Scheduled(fixedRate = 1000)  // every 1 mai run hoga ticker
-    public void updateTickers() {
-        getValidOkxSpotPairs();
-    }
-
-    private void updateCmcMetadata() {
-        String cmcData = redisTemplate.opsForValue().get("crypto:latest");
-        if (cmcData == null) {
-            logger.warn("No CMC data, retrying in 10s");
-            Mono.delay(Duration.ofSeconds(10)).subscribe(v -> updateCmcMetadata());
-            return;
-        }
-
-        try {
-            JsonNode root = mapper.readTree(cmcData);
-            JsonNode dataArray = root.get("data");
-            if (dataArray == null || !dataArray.isArray()) {
-                logger.warn("Invalid CMC data, retrying in 10s");
-                Mono.delay(Duration.ofSeconds(10)).subscribe(v -> updateCmcMetadata());
-                return;
-            }
-
-            int updated = 0;
-            for (JsonNode coin : dataArray) {
-                String symbol = coin.get("symbol").asText();
-                String logo = redisTemplate.opsForValue().get("logo:" + symbol);
-                String supply = redisTemplate.opsForValue().get("supply:" + symbol);
-                if (logo == null && coin.has("logo")) {
-                    logo = coin.get("logo").asText();
-                    redisTemplate.opsForValue().set("logo:" + symbol, logo);
-                    updated++;
-                }
-                if (supply == null && coin.has("circulating_supply")) {
-                    supply = String.valueOf(coin.get("circulating_supply").asDouble());
-                    redisTemplate.opsForValue().set("supply:" + symbol, supply);
-                }
-            }
-            logger.info("Updated metadata for {} coins from CMC", updated);
-        } catch (Exception e) {
-            logger.error("Error updating CMC metadata: {}, retrying in 10s", e.getMessage());
-            Mono.delay(Duration.ofSeconds(10)).subscribe(v -> updateCmcMetadata());
-        }
-    }
-
     private void fetchHistoricalCandlesticks() {
+        logger.info("Fetching historical candlesticks for all valid pairs");
         List<String> validPairs = getValidOkxSpotPairs();
         for (String instId : validPairs) {
             try {
-                String url = "https://www.okx.com/api/v5/market/candles?instId=" + instId + "&bar=1H&limit=24";
+                String url = "https://www.okx.com/api/v5/market/candles?instId=" + instId + "&bar=1m&limit=60";
                 String response = restTemplate.getForObject(url, String.class);
+                if (response == null) {
+                    logger.warn("No response for historical candlesticks for {}", instId);
+                    continue;
+                }
+                logger.debug("Historical candlesticks response for {}: {}", instId, response);
+
                 JsonNode root = mapper.readTree(response);
                 JsonNode dataArray = root.get("data");
                 if (dataArray == null || dataArray.isEmpty()) {
@@ -102,37 +65,96 @@ public class OkxCandlestickService {
                     continue;
                 }
 
-                List<String> candles = new ArrayList<>();
+                Map<String, String> candles = new HashMap<>();
+                String latestCandleJson = null;
+                long latestTimestamp = 0;
+
                 for (JsonNode candle : dataArray) {
+                    String timestamp = candle.get(0).asText();
                     Map<String, Object> candleData = new HashMap<>();
-                    candleData.put("timestamp", candle.get(0).asLong());
-                    candleData.put("open", candle.get(1).asDouble());
-                    candleData.put("high", candle.get(2).asDouble());
-                    candleData.put("low", candle.get(3).asDouble());
-                    candleData.put("close", candle.get(4).asDouble());
-                    candleData.put("volume", candle.get(5).asDouble());
-                    candles.add(mapper.writeValueAsString(candleData));
+                    double open = candle.get(1).asDouble();
+                    double high = candle.get(2).asDouble();
+                    double low = candle.get(3).asDouble();
+                    double close = candle.get(4).asDouble();
+                    double volume = candle.get(5).asDouble();
+                    candleData.put("open", open);
+                    candleData.put("high", high);
+                    candleData.put("low", low);
+                    candleData.put("close", close);
+                    candleData.put("volume", volume);
+                    candleData.put("price", close);
+                    candleData.put("timestamp", Long.parseLong(timestamp));
+
+                    // Fetch 24h change and volume from TICKER:{PAIR}
+                    String tickerJson = redisTemplate.opsForValue().get("TICKER:" + instId);
+                    double change24h = 0.0;
+                    double volume24h = 0.0;
+                    if (tickerJson != null) {
+                        JsonNode ticker = mapper.readTree(tickerJson);
+                        double lastPrice = ticker.get("last").asDouble();
+                        double open24h = ticker.get("open24h").asDouble();
+                        change24h = open24h != 0 ? ((lastPrice - open24h) / open24h) * 100 : 0.0;
+                        volume24h = ticker.get("vol24h").asDouble();
+                    }
+                    candleData.put("change24h", String.format("%.2f", change24h));
+                    candleData.put("volume24h", volume24h);
+
+                    // Fetch logo and circulating supply
+                    String symbol = instId.replace("-USDT", "");
+                    Object logoObj = redisTemplate.opsForHash().get("COININFO:" + symbol, "logo");
+                    Object circulatingSupplyObj = redisTemplate.opsForHash().get("COININFO:" + symbol, "circulating_supply");
+                    String logo = logoObj != null ? logoObj.toString() : "https://default.logo.png";
+                    String circulatingSupply = circulatingSupplyObj != null ? circulatingSupplyObj.toString() : "0";
+                    double circSupply;
+                    try {
+                        circSupply = Double.parseDouble(circulatingSupply);
+                    } catch (NumberFormatException e) {
+                        logger.warn("Invalid circulating_supply for {}: {}", symbol, circulatingSupply);
+                        circSupply = 0.0;
+                    }
+                    candleData.put("logo", logo);
+                    candleData.put("circulatingSupply", circSupply);
+
+                    String candleJson = mapper.writeValueAsString(candleData);
+                    candles.put(timestamp, candleJson);
+
+                    // Track the latest candlestick
+                    long candleTimestamp = Long.parseLong(timestamp);
+                    if (candleTimestamp > latestTimestamp) {
+                        latestTimestamp = candleTimestamp;
+                        latestCandleJson = candleJson;
+                    }
                 }
-                for (int i = candles.size() - 1; i >= 0; i--) {
-                    redisTemplate.opsForList().rightPush("candle:" + instId, candles.get(i));
+
+                // Store in CANDLES:{PAIR}:1m
+                redisTemplate.opsForHash().putAll("CANDLES:" + instId + ":1m", candles);
+                redisTemplate.expire("CANDLES:" + instId + ":1m", 1, TimeUnit.HOURS);
+
+                // Store latest candlestick
+                if (latestCandleJson != null) {
+                    redisTemplate.opsForValue().set("candle:latest:" + instId, latestCandleJson, 1, TimeUnit.HOURS);
+                    logger.debug("Stored latest candlestick for {}: {}", instId, latestCandleJson);
                 }
-                redisTemplate.opsForList().trim("candle:" + instId, -24, -1);
-                logger.info("Stored {} historical candlesticks for {}", candles.size(), instId);
+
+                redisTemplate.opsForSet().add("active:pairs", instId);
+                logger.info("Stored {} historical 1m candlesticks for {}", candles.size(), instId);
+            } catch (JsonProcessingException e) {
+                logger.error("JSON parsing error for historical candlesticks for {}: {}", instId, e.getMessage(), e);
             } catch (Exception e) {
-                logger.error("Error fetching historical candlesticks for {}: {}", instId, e.getMessage());
+                logger.error("Error fetching historical candlesticks for {}: {}", instId, e.getMessage(), e);
             }
         }
     }
 
     public void subscribeToCandlesticks() {
-        List<String> validPairs = getValidOkxSpotPairs();
-        if (validPairs.isEmpty()) {
-            logger.warn("No valid OKX spot pairs, retrying in 5s");
+        Set<String> activePairs = redisTemplate.opsForSet().members("active:pairs");
+        if (activePairs == null || activePairs.isEmpty()) {
+            logger.warn("No active pairs in active:pairs, retrying in 5s");
             Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToCandlesticks());
             return;
         }
 
-        List<String> topPairs = getTopPairsByVolume(validPairs, 50);
+        List<String> topPairs = getTopPairsByVolume(new ArrayList<>(activePairs), 50);
         if (topPairs.isEmpty()) {
             logger.warn("No top pairs found, retrying in 5s");
             Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToCandlesticks());
@@ -142,7 +164,7 @@ public class OkxCandlestickService {
         List<Map<String, String>> argsList = new ArrayList<>();
         for (String instId : topPairs) {
             Map<String, String> arg = new HashMap<>();
-            arg.put("channel", "candle1H");
+            arg.put("channel", "candle1m");
             arg.put("instId", instId);
             argsList.add(arg);
         }
@@ -153,25 +175,34 @@ public class OkxCandlestickService {
 
         try {
             String payload = mapper.writeValueAsString(subscribeMsg);
-            logger.info("Subscribing to candlesticks for {} pairs", topPairs.size());
+            logger.info("Subscribing to 1m candlesticks for {} pairs: {}", topPairs.size(), topPairs);
 
             client.execute(
                     URI.create(websocketUrl),
-                    session -> session.send(Mono.just(session.textMessage(payload)))
-                            .doOnSuccess(v -> logger.info("Subscribed to candlesticks"))
-                            .thenMany(session.receive()
-                                    .map(WebSocketMessage::getPayloadAsText)
-                                    .doOnNext(msg -> logger.debug("Received candlestick: {}", msg))
-                                    .doOnNext(this::handleCandlestickData)
-                                    .doOnError(e -> logger.error("WebSocket receive error: {}", e.getMessage())))
-                            .then()
+                    session -> {
+                        logger.info("WebSocket connected to {}", websocketUrl);
+                        logger.info("Sending subscription payload: {}", payload);
+                        return session.send(Mono.just(session.textMessage(payload)))
+                                .doOnSuccess(v -> logger.info("Subscription sent successfully"))
+                                .thenMany(session.receive()
+                                        .map(WebSocketMessage::getPayloadAsText)
+                                        .doOnNext(msg -> logger.debug("Received WebSocket message: {}", msg))
+                                        .doOnNext(this::handleCandlestickData)
+                                        .doOnError(e -> logger.error("WebSocket receive error: {}", e.getMessage())))
+                                .then();
+                    }
             ).doOnError(e -> {
-                logger.error("WebSocket connection error: {}", e.getMessage());
-                Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToCandlesticks());
+                logger.error("WebSocket connection failed: {}", e.getMessage(), e);
+                long delay = 5 + ThreadLocalRandom.current().nextLong(10);
+                logger.info("Retrying subscription in {} seconds", delay);
+                Mono.delay(Duration.ofSeconds(delay)).subscribe(v -> subscribeToCandlesticks());
             }).subscribe();
 
+        } catch (JsonProcessingException e) {
+            logger.error("JSON serialization error for subscription: {}", e.getMessage(), e);
+            Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToCandlesticks());
         } catch (Exception e) {
-            logger.error("Subscription error: {}", e.getMessage());
+            logger.error("Subscription error: {}", e.getMessage(), e);
             Mono.delay(Duration.ofSeconds(5)).subscribe(v -> subscribeToCandlesticks());
         }
     }
@@ -192,108 +223,72 @@ public class OkxCandlestickService {
             }
 
             String instId = argNode.get("instId").asText();
-            String symbol = instId.replace("-USDT", "");
-
-            for (JsonNode candle : dataArray) {
-                if (!candle.isArray() || candle.size() < 6) {
-                    logger.warn("Invalid candlestick format for {}: {}", instId, candle);
-                    continue;
-                }
-
-                long timestamp;
-                double open, high, low, close, volume;
-                try {
-                    timestamp = candle.get(0).asLong();
-                    open = candle.get(1).asDouble();
-                    high = candle.get(2).asDouble();
-                    low = candle.get(3).asDouble();
-                    close = candle.get(4).asDouble();
-                    volume = candle.get(5).asDouble();
-                    logger.debug("Candlestick for {}: open={}, close={}", instId, open, close);
-                } catch (Exception e) {
-                    logger.warn("Failed to parse candlestick for {}: {}", instId, e.getMessage());
-                    continue;
-                }
-
-                Map<String, Object> candleData = new HashMap<>();
-                candleData.put("timestamp", timestamp);
-                candleData.put("open", open);
-                candleData.put("high", high);
-                candleData.put("low", low);
-                candleData.put("close", close);
-                candleData.put("volume", volume);
-
-                String candleJson;
-                try {
-                    candleJson = mapper.writeValueAsString(candleData);
-                } catch (JsonProcessingException e) {
-                    logger.error("Failed to serialize candlestick for {}: {}", instId, e.getMessage());
-                    continue;
-                }
-
-                redisTemplate.opsForList().leftPush("candle:" + instId, candleJson);
-                redisTemplate.opsForList().trim("candle:" + instId, 0, 23);
-
-                double price24hAgo = 0.0;
-                double percentChange24h = 0.0;
-                Long size = redisTemplate.opsForList().size("candle:" + instId);
-                if (size != null && size >= 24) {
-                    String oldestCandleJson = redisTemplate.opsForList().index("candle:" + instId, 23);
-                    if (oldestCandleJson != null) {
-                        try {
-                            JsonNode oldestCandle = mapper.readTree(oldestCandleJson);
-                            price24hAgo = oldestCandle.get("open").asDouble();
-                            percentChange24h = price24hAgo != 0 ? ((close - price24hAgo) / price24hAgo) * 100 : 0.0;
-                            logger.debug("Calculated change24h for {}: {}% (close={}, price24hAgo={})",
-                                    instId, percentChange24h, close, price24hAgo);
-                        } catch (JsonProcessingException e) {
-                            logger.warn("Failed to parse oldest candlestick for {}: {}", instId, e.getMessage());
-                        }
-                    }
-                } else {
-                    logger.debug("Not enough candles for {} to calculate change24h (size={})", instId, size);
-                    String tickerJson = redisTemplate.opsForValue().get("ticker:" + instId);
-                    if (tickerJson != null) {
-                        try {
-                            JsonNode ticker = mapper.readTree(tickerJson);
-                            double lastPrice = ticker.get("last").asDouble();
-                            double open24h = ticker.get("open24h").asDouble();
-                            percentChange24h = open24h != 0 ? ((lastPrice - open24h) / open24h) * 100 : 0.0;
-                            logger.debug("Fallback change24h for {}: {}% (last={}, open24h={})",
-                                    instId, percentChange24h, lastPrice, open24h);
-                        } catch (Exception e) {
-                            logger.warn("Failed to parse ticker for {}: {}", instId, e.getMessage());
-                        }
-                    }
-                }
-
-                String formattedChange = String.format("%.2f", percentChange24h);
-                redisTemplate.opsForValue().set("change24h:" + instId, formattedChange);
-                redisTemplate.opsForValue().set("okx:" + instId + ":close", String.format("%.6f", close));
-
-                String logo = redisTemplate.opsForValue().get("logo:" + symbol);
-                String circulatingSupply = redisTemplate.opsForValue().get("supply:" + symbol);
-
-                Map<String, Object> update = new HashMap<>();
-                update.put("pair", instId);
-                update.put("price", close);
-                update.put("change24h", Double.parseDouble(formattedChange));
-                update.put("logo", logo);
-                update.put("circulatingSupply", circulatingSupply != null ? Double.parseDouble(circulatingSupply) : null);
-                update.put("timestamp", timestamp);
-                update.put("volume24h", volume);
-
-                try {
-                    String updateJson = mapper.writeValueAsString(update);
-                    redisTemplate.opsForValue().set("candle:latest:" + instId, updateJson);
-                    logger.debug("Stored candle:latest for {}: {}", instId, updateJson);
-                } catch (JsonProcessingException e) {
-                    logger.error("Failed to serialize update for {}: {}", instId, e.getMessage());
-                }
+            JsonNode candle = dataArray.get(0);
+            if (!candle.isArray() || candle.size() < 6) {
+                logger.warn("Invalid candlestick format for {}: {}", instId, candle);
+                return;
             }
 
+            String timestamp = candle.get(0).asText();
+            Map<String, Object> candleData = new HashMap<>();
+            double open = candle.get(1).asDouble();
+            double high = candle.get(2).asDouble();
+            double low = candle.get(3).asDouble();
+            double close = candle.get(4).asDouble();
+            double volume = candle.get(5).asDouble();
+            candleData.put("open", open);
+            candleData.put("high", high);
+            candleData.put("low", low);
+            candleData.put("close", close);
+            candleData.put("volume", volume);
+            candleData.put("price", close);
+            candleData.put("timestamp", Long.parseLong(timestamp));
+
+            // Fetch 24h change and volume from TICKER:{PAIR}
+            String tickerJson = redisTemplate.opsForValue().get("TICKER:" + instId);
+            double change24h = 0.0;
+            double volume24h = 0.0;
+            if (tickerJson != null) {
+                JsonNode ticker = mapper.readTree(tickerJson);
+                double lastPrice = ticker.get("last").asDouble();
+                double open24h = ticker.get("open24h").asDouble();
+                change24h = open24h != 0 ? ((lastPrice - open24h) / open24h) * 100 : 0.0;
+                volume24h = ticker.get("vol24h").asDouble();
+            }
+            candleData.put("change24h", String.format("%.2f", change24h));
+            candleData.put("volume24h", volume24h);
+
+            // Fetch logo and circulating supply
+            String symbol = instId.replace("-USDT", "");
+            Object logoObj = redisTemplate.opsForHash().get("COININFO:" + symbol, "logo");
+            Object circulatingSupplyObj = redisTemplate.opsForHash().get("COININFO:" + symbol, "circulating_supply");
+            String logo = logoObj != null ? logoObj.toString() : "https://default.logo.png";
+            String circulatingSupply = circulatingSupplyObj != null ? circulatingSupplyObj.toString() : "0";
+            double circSupply;
+            try {
+                circSupply = Double.parseDouble(circulatingSupply);
+            } catch (NumberFormatException e) {
+                logger.warn("Invalid circulating_supply for {}: {}", symbol, circulatingSupply);
+                circSupply = 0.0;
+            }
+            candleData.put("logo", logo);
+            candleData.put("circulatingSupply", circSupply);
+
+            String candleJson = mapper.writeValueAsString(candleData);
+            logger.debug("Storing candlestick for {}: {}", instId, candleJson);
+            redisTemplate.opsForHash().put("CANDLES:" + instId + ":1m", timestamp, candleJson);
+            redisTemplate.expire("CANDLES:" + instId + ":1m", 1, TimeUnit.HOURS);
+
+            // Store latest candlestick
+            redisTemplate.opsForValue().set("candle:latest:" + instId, candleJson, 1, TimeUnit.HOURS);
+            logger.debug("Stored latest candlestick for {}: {}", instId, candleJson);
+
+            redisTemplate.opsForSet().add("active:pairs", instId);
+            logger.debug("Stored 1m candlestick for {} at {}", instId, timestamp);
+        } catch (JsonProcessingException e) {
+            logger.error("JSON parsing error for candlestick: {}", e.getMessage(), e);
         } catch (Exception e) {
-            logger.error("Error processing candlestick: {}", e.getMessage());
+            logger.error("Error processing candlestick: {}", e.getMessage(), e);
         }
     }
 
@@ -301,36 +296,33 @@ public class OkxCandlestickService {
         try {
             String url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT";
             String response = restTemplate.getForObject(url, String.class);
+            if (response == null) {
+                logger.warn("No response for OKX spot pairs");
+                return Arrays.asList("BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT", "ADA-USDT");
+            }
+            logger.debug("OKX spot pairs response: {}", response);
+
             JsonNode root = mapper.readTree(response);
+            JsonNode dataArray = root.get("data");
+            if (dataArray == null || !dataArray.isArray()) {
+                logger.warn("Invalid OKX spot pairs response: {}", response);
+                return Arrays.asList("BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT", "ADA-USDT");
+            }
+
             List<String> pairs = new ArrayList<>();
-            List<Map<String, Object>> tickers = new ArrayList<>();
-            for (JsonNode ticker : root.get("data")) {
+            for (JsonNode ticker : dataArray) {
                 String instId = ticker.get("instId").asText();
                 if (instId.endsWith("-USDT")) {
                     pairs.add(instId);
-                    Map<String, Object> tickerData = new HashMap<>();
-                    tickerData.put("instId", instId);
-                    tickerData.put("last", ticker.get("last").asDouble());
-                    tickerData.put("open24h", ticker.get("open24h").asDouble());
-                    tickerData.put("vol24h", ticker.get("vol24h").asDouble());
-                    tickers.add(tickerData);
-                    try {
-                        redisTemplate.opsForValue().set("ticker:" + instId, mapper.writeValueAsString(tickerData));
-                    } catch (JsonProcessingException e) {
-                        logger.warn("Failed to store ticker for {}: {}", instId, e.getMessage());
-                    }
                 }
             }
-            try {
-                redisTemplate.opsForValue().set("tickers:latest", mapper.writeValueAsString(tickers));
-                logger.info("Stored tickers:latest with {} entries", tickers.size());
-            } catch (JsonProcessingException e) {
-                logger.error("Failed to store tickers:latest: {}", e.getMessage());
-            }
-            logger.info("Fetched {} valid OKX spot pairs", pairs.size());
+            logger.info("Fetched {} valid OKX spot pairs: {}", pairs.size(), pairs);
             return pairs;
+        } catch (JsonProcessingException e) {
+            logger.error("JSON parsing error for OKX pairs: {}", e.getMessage(), e);
+            return Arrays.asList("BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT", "ADA-USDT");
         } catch (Exception e) {
-            logger.error("Error fetching OKX pairs: {}", e.getMessage());
+            logger.error("Error fetching OKX pairs: {}", e.getMessage(), e);
             return Arrays.asList("BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT", "BNB-USDT", "ADA-USDT");
         }
     }
@@ -339,9 +331,21 @@ public class OkxCandlestickService {
         try {
             String url = "https://www.okx.com/api/v5/market/tickers?instType=SPOT";
             String response = restTemplate.getForObject(url, String.class);
+            if (response == null) {
+                logger.warn("No response for OKX tickers");
+                return validPairs.stream().limit(limit).collect(Collectors.toList());
+            }
+            logger.debug("OKX tickers response: {}", response);
+
             JsonNode root = mapper.readTree(response);
+            JsonNode dataArray = root.get("data");
+            if (dataArray == null || !dataArray.isArray()) {
+                logger.warn("Invalid OKX tickers response: {}", response);
+                return validPairs.stream().limit(limit).collect(Collectors.toList());
+            }
+
             List<Map<String, Object>> tickers = new ArrayList<>();
-            for (JsonNode ticker : root.get("data")) {
+            for (JsonNode ticker : dataArray) {
                 String instId = ticker.get("instId").asText();
                 if (validPairs.contains(instId)) {
                     Map<String, Object> tickerData = new HashMap<>();
@@ -351,12 +355,23 @@ public class OkxCandlestickService {
                 }
             }
             tickers.sort((a, b) -> Double.compare((Double) b.get("vol24h"), (Double) a.get("vol24h")));
-            return tickers.stream()
-                    .limit(limit)
+            List<String> topPairs = tickers.stream()
                     .map(t -> (String) t.get("instId"))
                     .collect(Collectors.toList());
+
+            // Ensure ETH-USDT and SOL-USDT are included
+            List<String> priorityPairs = Arrays.asList("ETH-USDT", "SOL-USDT");
+            topPairs.removeAll(priorityPairs);
+            topPairs.addAll(0, priorityPairs);
+            topPairs = topPairs.stream().limit(limit).collect(Collectors.toList());
+
+            logger.info("Selected top {} pairs: {}", topPairs.size(), topPairs);
+            return topPairs;
+        } catch (JsonProcessingException e) {
+            logger.error("JSON parsing error for top pairs: {}", e.getMessage(), e);
+            return validPairs.stream().limit(limit).collect(Collectors.toList());
         } catch (Exception e) {
-            logger.error("Error fetching top pairs by volume: {}", e.getMessage());
+            logger.error("Error fetching top pairs by volume: {}", e.getMessage(), e);
             return validPairs.stream().limit(limit).collect(Collectors.toList());
         }
     }
